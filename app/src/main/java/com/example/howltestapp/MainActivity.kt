@@ -9,6 +9,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
@@ -26,6 +27,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.app.ActivityCompat
+import androidx.core.net.toUri
 import com.example.howltestapp.ui.theme.HowlTestAppTheme
 import org.pytorch.IValue
 import org.pytorch.LiteModuleLoader
@@ -55,6 +57,78 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+class StateMachine {
+
+    public class Label {
+        var label:Int = -1
+        var timeStamp:Long = -1
+        constructor (label:Int, timeStamp:Long) {
+            this.label = label
+            this.timeStamp = timeStamp
+        }
+    }
+    private var goal = -1
+    private var currentState = 0
+    private var lastTimeStamp = -0L
+    private var intervalThreshold = 0L
+    private var delayInterval = 0L
+    private var lastGoalTimeStamp = 0L
+
+    constructor (length:Int, intervalThreshold:Long, delayInterval:Long) {
+        this.goal = length
+        this.currentState = 0
+        this.lastTimeStamp - 1
+        this.intervalThreshold = intervalThreshold
+        this.delayInterval = delayInterval
+        this.lastGoalTimeStamp = -1
+
+    }
+
+    public fun getState():Int {
+        return this.currentState
+    }
+
+    fun transition(label:Label):Boolean {
+        var isGoal = false
+        val word = label.label
+        val t = label.timeStamp
+
+        if (t - this.lastTimeStamp > this.intervalThreshold) {
+            this.currentState = 0
+        }
+        if (word == this.currentState) {
+            this.currentState += 1
+            this.lastTimeStamp = t
+        }
+        else if (word < this.currentState) {
+            return false
+        }
+        else {
+            this.currentState = 0
+            return false
+        }
+
+        if (this.currentState == this.goal) {
+            this.currentState = 0
+            isGoal = true
+            if (isGoal && (t - this.lastGoalTimeStamp < this.delayInterval)) return false
+            this.lastGoalTimeStamp = t
+            this.lastTimeStamp = t
+        }
+
+        return isGoal
+    }
+
+    public fun update(labels: List<Label>):Boolean {
+        for (label in labels) {
+            val isGoal = this.transition(label)
+//            Log.d("update",this.currentState.toString())
+            if (isGoal) return true
+        }
+        return false
+    }
+}
+
 class DummyService : Service() {
     override fun onCreate() {
         super.onCreate()
@@ -77,6 +151,8 @@ class DummyService : Service() {
 
 class WakeWordService : Service() {
 
+    private var stateMachine:StateMachine = StateMachine(3,2000,1000) //in millisec
+    private var confidenceThreshold = 0.0f
     private var audioChunk:ShortArray = ShortArray(0);
     private lateinit var model:Module;
     private var isRun = true;
@@ -85,6 +161,9 @@ class WakeWordService : Service() {
     private val sampleRate = 16000
     private val strideSize = (this.sampleRate * 0.068).toInt()
     private val windowSize = (this.sampleRate * 0.5).toInt()
+    private val mediaPlayer by lazy {
+        MediaPlayer.create(this, this.assetFilePath(this, "huh.wav").toUri())
+    }
 
     fun assetFilePath(context: Context, asset: String): String {
         val file = File(context.filesDir, asset)
@@ -166,7 +245,7 @@ class WakeWordService : Service() {
     }
 
     fun initializeWakeWordModel() {
-        val assetFilePath = this.assetFilePath(this, "hey_ff_traced_full.ptl");
+        val assetFilePath = this.assetFilePath(this, "hello_cape_bee_traced_full.ptl");
         val module = LiteModuleLoader.load(assetFilePath);
         // Test forward pass
         val tensorBuffer = Tensor.allocateFloatBuffer(1088);
@@ -184,25 +263,48 @@ class WakeWordService : Service() {
         handler.post {
             while (true) {
                 if (this.audioChunk.size < 32) continue
-                val audioChunk = this.audioChunk.map {
-                    it -> (it / 32767.0).toFloat()
+                var audioChunk = this.audioChunk.map {
+                    it ->
+                    (it / 32767f)
                 }
+//                audioChunk = audioChunk.reversed()
                 var i = 0
-                var labels:ArrayList<Int> = arrayListOf()
+                var labels:ArrayList<StateMachine.Label> = ArrayList<StateMachine.Label>();
+                var labelsNum: ArrayList<Int> = arrayListOf();
                 while (i < (audioChunk.size - this.windowSize)) {
                     var windowed = audioChunk.slice(IntRange(i, i + this.windowSize - 1)).toFloatArray()
                     val inputTensor: Tensor = Tensor.fromBlob(windowed, longArrayOf(windowed.size.toLong()))
                     val output:Tensor = this.model.forward(IValue.from(inputTensor)).toTensor();
                     val o = output.dataAsFloatArray;
                     val predictedLabel = o.withIndex().maxByOrNull { it.value }?.index as Int
-                    if (predictedLabel != 3 && !labels.contains(predictedLabel)) {
-                        labels.add(predictedLabel)
-                        println(predictedLabel)
+                    val predictScore = o.withIndex().maxByOrNull { it.value }?.value as Float
+                    if (predictedLabel != 3 && !labelsNum.contains(predictedLabel) && predictScore > this.confidenceThreshold) {
+                        labelsNum.add(predictedLabel)
+                        val label:StateMachine.Label = StateMachine.Label(predictedLabel, System.currentTimeMillis())
+                        labels.add(label)
+//                        Log.d("ww",predictedLabel.toString() + " " +predictScore.toString())
                     }
                     i += this.strideSize
                 }
-                labels.forEach {
-                    println(it)
+                val isGoal = stateMachine.update(labels)
+                if (isGoal) {
+//                     broadcast to mainactivity
+//                        val sendDetectSignal = Intent()
+//                        sendDetectSignal.action = "WAKEWORD_DETECTED"
+//                        sendDetectSignal.putExtra("DETECTED", true)
+//                        sendBroadcast(sendDetectSignal)
+                    this.mediaPlayer.start()
+                    Log.d("isGoal","detected at " + System.currentTimeMillis().toString())
+                }
+                if (labels.size > 0 ) {
+                    var b:StringBuilder = java.lang.StringBuilder()
+                    b.append(stateMachine.getState())
+                    b.append(" | ")
+                    labels.forEach {
+                        b.append(it.label)
+                        b.append(" ")
+                    }
+                    Log.d("ww", b.toString())
                 }
             }
         }
@@ -226,7 +328,7 @@ class AudioCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var audioDataCallback: ((ByteArray) -> Unit)? = null
-    private val audioBufferSize = 500 // Adjust the buffer size as needed
+    private val audioBufferSize = 600 // Adjust the buffer size as needed
     private var maxSize:Int = 32;
     private var currentSize:Int = 0
     private var chunkBuffer:ShortArray = ShortArray(0);
