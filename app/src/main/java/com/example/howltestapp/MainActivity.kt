@@ -151,7 +151,7 @@ class DummyService : Service() {
 
 class WakeWordService : Service() {
 
-    private var stateMachine:StateMachine = StateMachine(3,2000,1000) //in millisec
+    private var stateMachine:StateMachine = StateMachine(3,1000,1000) //in millisec
     private var confidenceThreshold = 0.0f
     private var audioChunk:ShortArray = ShortArray(0);
     private lateinit var model:Module;
@@ -271,17 +271,24 @@ class WakeWordService : Service() {
                 var i = 0
                 var labels:ArrayList<StateMachine.Label> = ArrayList<StateMachine.Label>();
                 var labelsNum: ArrayList<Int> = arrayListOf();
+                var confidences: ArrayList<Float> = arrayListOf();
                 while (i < (audioChunk.size - this.windowSize)) {
                     var windowed = audioChunk.slice(IntRange(i, i + this.windowSize - 1)).toFloatArray()
+
+//                    Log.d("audio frame",windowed.map {
+//                        it -> "%.6f".format(it)
+//                    }.joinToString(","))
+
                     val inputTensor: Tensor = Tensor.fromBlob(windowed, longArrayOf(windowed.size.toLong()))
                     val output:Tensor = this.model.forward(IValue.from(inputTensor)).toTensor();
                     val o = output.dataAsFloatArray;
                     val predictedLabel = o.withIndex().maxByOrNull { it.value }?.index as Int
                     val predictScore = o.withIndex().maxByOrNull { it.value }?.value as Float
-                    if (predictedLabel != 3 && !labelsNum.contains(predictedLabel) && predictScore > this.confidenceThreshold) {
+                    if (predictedLabel != 3 && predictScore > this.confidenceThreshold) {
                         labelsNum.add(predictedLabel)
                         val label:StateMachine.Label = StateMachine.Label(predictedLabel, System.currentTimeMillis())
                         labels.add(label)
+                        confidences.add(predictScore)
 //                        Log.d("ww",predictedLabel.toString() + " " +predictScore.toString())
                     }
                     i += this.strideSize
@@ -304,6 +311,11 @@ class WakeWordService : Service() {
                         b.append(it.label)
                         b.append(" ")
                     }
+                    b.append("-------")
+                    confidences.forEach {
+                        b.append(it)
+                        b.append(" ")
+                    }
                     Log.d("ww", b.toString())
                 }
             }
@@ -311,7 +323,7 @@ class WakeWordService : Service() {
     }
 
     private fun recognize(): ArrayList<Int> {
-        /// Recognize : return recognized class softmaxly
+        /// Recognize : return recognized class sconfidenceThresholdoftmaxly
         return arrayListOf(1,2,3,4)
     }
     override fun onBind(intent: Intent?): IBinder? {
@@ -328,7 +340,7 @@ class AudioCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var audioDataCallback: ((ByteArray) -> Unit)? = null
-    private val audioBufferSize = 600 // Adjust the buffer size as needed
+    private val audioBufferSize = 500 // Adjust the buffer size as needed
     private var maxSize:Int = 32;
     private var currentSize:Int = 0
     private var chunkBuffer:ShortArray = ShortArray(0);
@@ -380,11 +392,11 @@ class AudioCaptureService : Service() {
             return
         }
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.DEFAULT,
             16000,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            minBufferSize.coerceAtLeast(audioBufferSize)
+            this.audioBufferSize
         )
 
         audioRecord?.startRecording()
