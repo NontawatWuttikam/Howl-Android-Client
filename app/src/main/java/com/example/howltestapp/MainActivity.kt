@@ -15,8 +15,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
-import android.os.SystemClock.sleep
 import android.util.Log
+import android.util.Range
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
@@ -43,8 +43,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val wakewordIntent = Intent(this, WakeWordService::class.java)
-        startService(wakewordIntent)
+
+//        val wakewordIntent2 = Intent(this, WakeWordService::class.java)
+//        wakewordIntent2.putExtra("MODEL_FILE", "hey_ff_traced_full.ptl")
+//        wakewordIntent2.putExtra("ALERT_AUDIO_FILE","huh.wav")
+//        startService(wakewordIntent2)
+
+        val wakewordIntent1 = Intent(this, WakeWordService::class.java)
+        wakewordIntent1.putExtra("MODEL_FILE", "hello_cape_bee_5k49ep_traced_full.ptl")
+        wakewordIntent1.putExtra("ALERT_AUDIO_FILE","huh.wav")
+        startService(wakewordIntent1)
 
         setContent {
             HowlTestAppTheme {
@@ -62,9 +70,11 @@ class StateMachine {
     public class Label {
         var label:Int = -1
         var timeStamp:Long = -1
-        constructor (label:Int, timeStamp:Long) {
+        var confidence:Float = -1.0f
+        constructor (label:Int, timeStamp:Long, confidence:Float) {
             this.label = label
             this.timeStamp = timeStamp
+            this.confidence = confidence
         }
     }
     private var goal = -1
@@ -73,15 +83,17 @@ class StateMachine {
     private var intervalThreshold = 0L
     private var delayInterval = 0L
     private var lastGoalTimeStamp = 0L
+    private var confidenceLookup:ArrayList<Float> = arrayListOf()
+    private var confidenceScore:ArrayList<Float> = arrayListOf()
 
-    constructor (length:Int, intervalThreshold:Long, delayInterval:Long) {
+    constructor (length:Int, intervalThreshold:Long, delayInterval:Long, confidenceLookup:ArrayList<Float>) {
         this.goal = length
         this.currentState = 0
         this.lastTimeStamp - 1
         this.intervalThreshold = intervalThreshold
         this.delayInterval = delayInterval
         this.lastGoalTimeStamp = -1
-
+        this.confidenceLookup = confidenceLookup
     }
 
     public fun getState():Int {
@@ -91,27 +103,43 @@ class StateMachine {
     fun transition(label:Label):Boolean {
         var isGoal = false
         val word = label.label
+        val confidence = label.confidence
         val t = label.timeStamp
 
         if (t - this.lastTimeStamp > this.intervalThreshold) {
             this.currentState = 0
+            confidenceScore.clear()
         }
-        if (word == this.currentState) {
+
+        if (word == this.currentState && confidence >= confidenceLookup[word]) {
+            if (this.currentState == 0) confidenceScore.clear()
             this.currentState += 1
             this.lastTimeStamp = t
+            confidenceScore.add(confidence)
         }
         else if (word < this.currentState) {
+//            this.currentState = 0
+//            confidenceScore.clear()
             return false
         }
         else {
             this.currentState = 0
+            confidenceScore.clear()
             return false
         }
 
         if (this.currentState == this.goal) {
             this.currentState = 0
             isGoal = true
-            if (isGoal && (t - this.lastGoalTimeStamp < this.delayInterval)) return false
+            if (isGoal && (t - this.lastGoalTimeStamp < this.delayInterval)) {
+                Log.d("ww", "DELAY INTERVAL SUPPRESS")
+                return false
+            }
+            var conf = "confidences : "
+            confidenceScore.forEach {
+                conf += it.toString() + " "
+            }
+            Log.d("confidences", conf)
             this.lastGoalTimeStamp = t
             this.lastTimeStamp = t
         }
@@ -123,7 +151,9 @@ class StateMachine {
         for (label in labels) {
             val isGoal = this.transition(label)
 //            Log.d("update",this.currentState.toString())
-            if (isGoal) return true
+            if (isGoal) {
+                return true
+            }
         }
         return false
     }
@@ -150,9 +180,8 @@ class DummyService : Service() {
 }
 
 class WakeWordService : Service() {
-
-    private var stateMachine:StateMachine = StateMachine(3,1000,1000) //in millisec
-    private var confidenceThreshold = 0.0f
+    private var wwLength = 3
+    private var stateMachine:StateMachine = StateMachine(wwLength,100,300, arrayListOf(0.0f, 0.0f, 0.0f)) //in millisec
     private var audioChunk:ShortArray = ShortArray(0);
     private lateinit var model:Module;
     private var isRun = true;
@@ -160,10 +189,11 @@ class WakeWordService : Service() {
     private lateinit var handler:Handler;
     private val sampleRate = 16000
     private val strideSize = (this.sampleRate * 0.068).toInt()
-    private val windowSize = (this.sampleRate * 0.5).toInt()
-    private val mediaPlayer by lazy {
-        MediaPlayer.create(this, this.assetFilePath(this, "huh.wav").toUri())
-    }
+    private val windowSize = (this.sampleRate * 0.4).toInt()
+    private val wordOccurrenceThreshold = 1 // กี่คำถึงจะนับว่าเจอ เช่น 3 คือต้องเจอ window ติดกัน 3 ครั้ง
+    private lateinit var mediaPlayer:MediaPlayer
+    private lateinit var modelFile:String
+    private lateinit var audioFile:String
 
     fun assetFilePath(context: Context, asset: String): String {
         val file = File(context.filesDir, asset)
@@ -240,12 +270,18 @@ class WakeWordService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent != null) {
+            this.modelFile = intent.getStringExtra("MODEL_FILE").toString()
+            this.audioFile = intent.getStringExtra("ALERT_AUDIO_FILE").toString()
+        }
+        this.mediaPlayer = MediaPlayer.create(this, this.assetFilePath(this, this.audioFile).toUri())
+
         this.startRecognize()
         return START_STICKY
     }
 
     fun initializeWakeWordModel() {
-        val assetFilePath = this.assetFilePath(this, "hello_cape_bee_traced_full.ptl");
+        val assetFilePath = this.assetFilePath(this, this.modelFile);
         val module = LiteModuleLoader.load(assetFilePath);
         // Test forward pass
         val tensorBuffer = Tensor.allocateFloatBuffer(1088);
@@ -256,7 +292,36 @@ class WakeWordService : Service() {
         this.model = module
     }
 
+    fun mergeAdjacentLabels(labels: ArrayList<StateMachine.Label>): ArrayList<StateMachine.Label> {
+        if (labels.size == 0) return labels
+        var current = labels[0].label
+        var pos = 0
+        var outLabels = arrayListOf<StateMachine.Label>()
+        labels.slice(IntRange(1, labels.size - 1)).forEachIndexed {index, it ->
+            val idx = index + 1
+            if (it.label == current) pos++
+            else {
+                var toMerge = labels.slice(IntRange(pos, idx - 1))
+                var merged = StateMachine.Label(toMerge[0].label, toMerge[0].timeStamp, toMerge.map { it -> it.confidence}.max())
+                outLabels.add(merged)
+                pos = idx
+            }
+            current = it.label
+        }
+        var toMerge = labels.slice(IntRange(pos, labels.size - 1))
+        var merged = StateMachine.Label(toMerge[0].label, toMerge[0].timeStamp, toMerge.map { it -> it.confidence}.max())
+        outLabels.add(merged)
+        return outLabels
+    }
 
+
+    fun clamp(`val`: Float, min: Float, max: Float): Float {
+        return Math.max(min, Math.min(max, `val`))
+    }
+
+//    fun isConfidencesSatified(confidences: ArrayList<Float>): Boolean {
+//        return confidences[0] > 0.7f && confidences[1] > 0.7f && confidences[2] > 0.6f
+//    }
 
     private fun startRecognize() {
         initializeWakeWordModel()
@@ -265,8 +330,12 @@ class WakeWordService : Service() {
                 if (this.audioChunk.size < 32) continue
                 var audioChunk = this.audioChunk.map {
                     it ->
-                    (it / 32767f)
+                    clamp((it / 32767f)*1.0f,-1f,1f)
                 }
+//                audioChunk = this.audioChunk.map {
+//                        it ->
+//                    (2*((it - audioChunk.min())/(audioChunk.max() - audioChunk.min()))) - 1
+//                }
 //                audioChunk = audioChunk.reversed()
                 var i = 0
                 var labels:ArrayList<StateMachine.Label> = ArrayList<StateMachine.Label>();
@@ -284,26 +353,23 @@ class WakeWordService : Service() {
                     val o = output.dataAsFloatArray;
                     val predictedLabel = o.withIndex().maxByOrNull { it.value }?.index as Int
                     val predictScore = o.withIndex().maxByOrNull { it.value }?.value as Float
-                    if (predictedLabel != 3 && predictScore > this.confidenceThreshold) {
+                    if (predictedLabel != 3) {
                         labelsNum.add(predictedLabel)
-                        val label:StateMachine.Label = StateMachine.Label(predictedLabel, System.currentTimeMillis())
+                        val label:StateMachine.Label = StateMachine.Label(predictedLabel, System.currentTimeMillis(), predictScore)
                         labels.add(label)
                         confidences.add(predictScore)
 //                        Log.d("ww",predictedLabel.toString() + " " +predictScore.toString())
                     }
                     i += this.strideSize
                 }
+
+                labels = mergeAdjacentLabels(labels)
                 val isGoal = stateMachine.update(labels)
                 if (isGoal) {
-//                     broadcast to mainactivity
-//                        val sendDetectSignal = Intent()
-//                        sendDetectSignal.action = "WAKEWORD_DETECTED"
-//                        sendDetectSignal.putExtra("DETECTED", true)
-//                        sendBroadcast(sendDetectSignal)
                     this.mediaPlayer.start()
                     Log.d("isGoal","detected at " + System.currentTimeMillis().toString())
                 }
-                if (labels.size > 0 ) {
+                if (labels.size > 0) {
                     var b:StringBuilder = java.lang.StringBuilder()
                     b.append(stateMachine.getState())
                     b.append(" | ")
@@ -312,8 +378,8 @@ class WakeWordService : Service() {
                         b.append(" ")
                     }
                     b.append("-------")
-                    confidences.forEach {
-                        b.append(it)
+                    labels.forEach {
+                        b.append(it.confidence)
                         b.append(" ")
                     }
                     Log.d("ww", b.toString())
